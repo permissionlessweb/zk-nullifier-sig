@@ -18,6 +18,7 @@ num-integer = "~0.1.45"
 k256 = {version = "~0.13.3", features = ["arithmetic", "hash2curve", "expose-field", "sha2"]}
 signature = "^2.2.0"
 serde = { version = "^1.0.0", features = ["derive"], optional = true }
+blake3 = "1.8.2"
 
 [dev-dependencies]
 hex = "0.4.3"

@@ -1,4 +1,5 @@
 use super::*;
+use crate::blake3xmd::{Blake3Xmd, DST_BLAKE3};
 use k256::{
     elliptic_curve::{
         hash2curve::{ExpandMsgXmd, GroupDigest},
@@ -16,6 +17,18 @@ pub(crate) fn hash_to_curve(
         &[[m, &encode_pt(pk)].concat().as_slice()],
         //b"CURVE_XMD:SHA-256_SSWU_RO_",
         &[DST],
+    )
+}
+
+// Hashes two values to the curve using blake3
+pub(crate) fn hash_to_curve_blake3(
+    m: &[u8],
+    pk: &ProjectivePoint,
+) -> Result<ProjectivePoint, k256::elliptic_curve::Error> {
+    Secp256k1::hash_from_bytes::<Blake3Xmd>(
+        &[[m, &crate::utils::encode_pt(pk)].concat().as_slice()],
+        //b"CURVE_XMD:SHA-256_SSWU_RO_",
+        &[DST_BLAKE3],
     )
 }
 

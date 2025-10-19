@@ -6,6 +6,8 @@ use helpers::{gen_test_scalar_sk, test_gen_signals, PlumeVersion};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, NonZeroScalar, ProjectivePoint};
 use plume_rustcrypto::{AffinePoint, PlumeSignature, PlumeSignatureV1Fields};
 
+use crate::helpers::HashVersion;
+
 const G: ProjectivePoint = ProjectivePoint::GENERATOR;
 const M: &[u8; 29] = b"An example app message string";
 const C_V1: [u8; 32] =
@@ -24,19 +26,19 @@ const C_V1: [u8; 32] =
 
 #[test]
 fn plume_v1_test() {
-    let test_data = test_gen_signals(M, PlumeVersion::V1);
-    let r_point = test_data.4.unwrap();
-    let hashed_to_curve_r = test_data.5.unwrap();
+    let test_data = test_gen_signals(M, PlumeVersion::V1, HashVersion::Sha256);
+    let r_point = test_data.5.unwrap();
+    let hashed_to_curve_r = test_data.6.unwrap();
 
     println!("{:?}", test_data.3);
-    println!("{}", NonZeroScalar::new(test_data.3).unwrap().to_string());
+    println!("{}", NonZeroScalar::new(test_data.4).unwrap().to_string());
 
     let sig = PlumeSignature {
         message: M.to_owned().into(),
         pk: (G * gen_test_scalar_sk()).into(),
         nullifier: test_data.1.into(),
         c: NonZeroScalar::from_repr(C_V1.into()).unwrap(),
-        s: NonZeroScalar::new(test_data.3).unwrap(),
+        s: NonZeroScalar::new(test_data.4).unwrap(),
         v1specific: Some(PlumeSignatureV1Fields {
             r_point: r_point.into(),
             hashed_to_curve_r: hashed_to_curve_r.into(),
@@ -94,16 +96,33 @@ fn plume_v1_test() {
 
 #[test]
 fn plume_v2_test() {
-    let test_data = test_gen_signals(M, PlumeVersion::V2);
+    let test_data = test_gen_signals(M, PlumeVersion::V2, HashVersion::Sha256);
     assert!(PlumeSignature {
         message: M.to_owned().into(),
         pk: (G * gen_test_scalar_sk()).into(),
         nullifier: test_data.1.into(),
-        c: NonZeroScalar::from_repr(test_data.2).unwrap(),
-        s: NonZeroScalar::new(test_data.3).unwrap(),
+        c: NonZeroScalar::from_repr(test_data.2.unwrap()).unwrap(),
+        s: NonZeroScalar::new(test_data.4).unwrap(),
         v1specific: None
     }
     .verify());
+}
+
+#[test]
+fn plume_v2_blake3_test() {
+    let test_data = test_gen_signals(M, PlumeVersion::V2, HashVersion::Blake3);
+    assert!(PlumeSignature {
+        message: M.to_owned().into(),
+        pk: (G * gen_test_scalar_sk()).into(),
+        nullifier: test_data.1.into(),
+        c: NonZeroScalar::from_repr(<[u8; 32] as Into<k256::FieldBytes>>::into(
+            *test_data.3.unwrap().as_bytes()
+        ))
+        .unwrap(),
+        s: NonZeroScalar::new(test_data.4).unwrap(),
+        v1specific: None
+    }
+    .verify_blake());
 }
 
 mod helpers {
@@ -127,6 +146,11 @@ mod helpers {
         V1,
         V2,
     }
+    #[derive(Debug)]
+    pub enum HashVersion {
+        Sha256,
+        Blake3,
+    }
 
     // Generates a deterministic secret key for deterministic testing. Should be replaced by random oracle in production deployments.
     pub fn gen_test_scalar_sk() -> Scalar {
@@ -145,17 +169,23 @@ mod helpers {
     }
 
     // Calls the hash to curve function for secp256k1, and returns the result as a ProjectivePoint
-    pub fn hash_to_secp(s: &[u8]) -> ProjectivePoint {
-        let pt: ProjectivePoint = Secp256k1::hash_from_bytes::<ExpandMsgXmd<Sha256>>(
-            &[s],
-            //b"CURVE_XMD:SHA-256_SSWU_RO_"
-            &[plume_rustcrypto::DST],
-        )
-        .unwrap();
+    pub fn hash_to_secp(s: &[u8], hash_version: HashVersion) -> ProjectivePoint {
+        let pt: ProjectivePoint = match hash_version {
+            HashVersion::Sha256 => Secp256k1::hash_from_bytes::<ExpandMsgXmd<Sha256>>(
+                &[s],
+                //b"CURVE_XMD:SHA-256_SSWU_RO_"
+                &[plume_rustcrypto::DST],
+            )
+            .unwrap(),
+            HashVersion::Blake3 => {
+                Secp256k1::hash_from_bytes::<Blake3Xmd>(&[s], &[DST_BLAKE3]).unwrap()
+            }
+        };
         pt
     }
 
     use k256::ProjectivePoint;
+    use plume_rustcrypto::blake3xmd::{Blake3Xmd, DST_BLAKE3};
     // These generate test signals as if it were passed from a secure enclave to wallet. Note that leaking these signals would leak pk, but not sk.
     // Outputs these 6 signals, in this order
     // g^sk																(private)
@@ -167,10 +197,12 @@ mod helpers {
     pub fn test_gen_signals(
         m: &[u8],
         version: PlumeVersion,
+        hash_version: HashVersion,
     ) -> (
         ProjectivePoint,
         ProjectivePoint,
-        Output<Sha256>,
+        Option<Output<Sha256>>,
+        Option<blake3::Hash>,
         Scalar,
         Option<ProjectivePoint>,
         Option<ProjectivePoint>,
@@ -191,18 +223,33 @@ mod helpers {
         let g_r = &g * &r;
 
         // hash[m, pk]
-        let hash_m_pk =
-            // zk_nullifier::hash_to_curve(m, &pk)
-            Secp256k1::hash_from_bytes::<ExpandMsgXmd<Sha256>>(
+        let hash_m_pk = match hash_version {
+            HashVersion::Sha256 => Secp256k1::hash_from_bytes::<ExpandMsgXmd<Sha256>>(
                 &[[
                     m,
                     // &encode_pt(pk)
-                    &pk.to_encoded_point(true).to_bytes().to_vec()
-                ].concat().as_slice()],
+                    &pk.to_encoded_point(true).to_bytes().to_vec(),
+                ]
+                .concat()
+                .as_slice()],
                 //b"CURVE_XMD:SHA-256_SSWU_RO_",
                 &[plume_rustcrypto::DST],
             )
-            .unwrap();
+            .unwrap(),
+            HashVersion::Blake3 => Secp256k1::hash_from_bytes::<Blake3Xmd>(
+                &[[
+                    m,
+                    // &encode_pt(pk)
+                    &pk.to_encoded_point(true).to_bytes().to_vec(),
+                ]
+                .concat()
+                .as_slice()],
+                //b"CURVE_XMD:BLAKE-3_SSWU_RO_",
+                &[DST_BLAKE3],
+            )
+            .unwrap(),
+        };
+        // zk_nullifier::hash_to_curve(m, &pk)
 
         println!(
             "h.x: {:?}",
@@ -240,37 +287,82 @@ mod helpers {
         let nullifier = &hash_m_pk * &sk;
 
         // The Fiat-Shamir type step.
-        let c = match version {
-            PlumeVersion::V1 => Sha256::digest(
-                vec![&g, &pk, &hash_m_pk, &nullifier, &g_r, &hash_m_pk_pow_r]
-                    .into_iter()
-                    .map(|x| x.to_encoded_point(true).to_bytes().to_vec())
-                    .collect::<Vec<_>>()
-                    .concat()
-                    .as_slice(),
-            ),
-            PlumeVersion::V2 => {
-                dbg!("entering `Sha256::digest` for `V2`");
-                let result = Sha256::digest(
-                    vec![&nullifier, &g_r, &hash_m_pk_pow_r]
-                        .into_iter()
-                        .map(|x| x.to_encoded_point(true).to_bytes().to_vec())
-                        .collect::<Vec<_>>()
-                        .concat()
-                        .as_slice(),
-                );
-                dbg!("finished `Sha256::digest` for `V2`");
-                result
-            }
+        let (c, cc) = match version {
+            PlumeVersion::V1 => match hash_version {
+                HashVersion::Sha256 => (
+                    Some(Sha256::digest(
+                        vec![&g, &pk, &hash_m_pk, &nullifier, &g_r, &hash_m_pk_pow_r]
+                            .into_iter()
+                            .map(|x| x.to_encoded_point(true).to_bytes().to_vec())
+                            .collect::<Vec<_>>()
+                            .concat()
+                            .as_slice(),
+                    )),
+                    None,
+                ),
+                HashVersion::Blake3 => (
+                    None,
+                    Some(blake3::hash(
+                        vec![&g, &pk, &hash_m_pk, &nullifier, &g_r, &hash_m_pk_pow_r]
+                            .into_iter()
+                            .map(|x| x.to_encoded_point(true).to_bytes().to_vec())
+                            .collect::<Vec<_>>()
+                            .concat()
+                            .as_slice(),
+                    )),
+                ),
+            },
+            PlumeVersion::V2 => match hash_version {
+                HashVersion::Sha256 => {
+                    dbg!("entering `Sha256::digest` for `V2`");
+                    let result = Sha256::digest(
+                        vec![&nullifier, &g_r, &hash_m_pk_pow_r]
+                            .into_iter()
+                            .map(|x| x.to_encoded_point(true).to_bytes().to_vec())
+                            .collect::<Vec<_>>()
+                            .concat()
+                            .as_slice(),
+                    );
+                    dbg!("finished `Sha256::digest` for `V2`");
+                    (Some(result), None)
+                }
+                HashVersion::Blake3 => {
+                    dbg!("entering `blake3::hash` for `V2`");
+                    let result = blake3::hash(
+                        vec![&nullifier, &g_r, &hash_m_pk_pow_r]
+                            .into_iter()
+                            .map(|x| x.to_encoded_point(true).to_bytes().to_vec())
+                            .collect::<Vec<_>>()
+                            .concat()
+                            .as_slice(),
+                    );
+                    dbg!("finished `blake3::hash` for `V2`");
+                    (None, Some(result))
+                }
+            },
         };
         dbg!(&c, version);
 
-        let c_scalar = Scalar::from_repr(c).unwrap();
+        let c_scalar = match hash_version {
+            HashVersion::Sha256 => Scalar::from_repr(c.unwrap()).unwrap(),
+            HashVersion::Blake3 => Scalar::from_repr(<[u8; 32] as Into<k256::FieldBytes>>::into(
+                *cc.unwrap().as_bytes(),
+            ))
+            .unwrap(),
+        };
         // This value is part of the discrete log equivalence (DLEQ) proof.
         let r_sk_c = r + sk * c_scalar;
 
         // Return the signature.
-        (pk, nullifier, c, r_sk_c, Some(g_r), Some(hash_m_pk_pow_r))
+        (
+            pk,
+            nullifier,
+            c,
+            cc,
+            r_sk_c,
+            Some(g_r),
+            Some(hash_m_pk_pow_r),
+        )
     }
 
     /* Yes, testing the tests isn't a conventional things.
@@ -282,7 +374,7 @@ mod helpers {
         // Test the hash-to-curve algorithm
         #[test]
         fn test_hash_to_curve() {
-            let h = hash_to_secp(b"abc");
+            let h = hash_to_secp(b"abc", HashVersion::Sha256);
             assert_eq!(
                 hex::encode(h.to_affine().to_encoded_point(false).x().unwrap()),
                 "3377e01eab42db296b512293120c6cee72b6ecf9f9205760bd9ff11fb3cb2c4b"
@@ -290,6 +382,18 @@ mod helpers {
             assert_eq!(
                 hex::encode(h.to_affine().to_encoded_point(false).y().unwrap()),
                 "7f95890f33efebd1044d382a01b1bee0900fb6116f94688d487c6c7b9c8371f6"
+            );
+        }
+        #[test]
+        fn test_hash_to_curve_blake3() {
+            let h = hash_to_secp(b"abc", HashVersion::Blake3);
+            assert_eq!(
+                hex::encode(h.to_affine().to_encoded_point(false).x().unwrap()),
+                "345571ae56fcc327b5a2e38a3581c6f34f1019843a53039ddaafbc21327044ce"
+            );
+            assert_eq!(
+                hex::encode(h.to_affine().to_encoded_point(false).y().unwrap()),
+                "9d82e199ff56011f881aa8573eda5cc6745c70a1825a6f5e799dd40af6c82e67"
             );
         }
     }
