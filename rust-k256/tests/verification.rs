@@ -3,6 +3,7 @@
 //! Their setup is shared, `mod helpers` contains barely not refactored code, which is still instrumental to the tests.
 
 use helpers::{gen_test_scalar_sk, test_gen_signals, PlumeVersion};
+use k256::elliptic_curve::subtle::Choice;
 use k256::{elliptic_curve::sec1::ToEncodedPoint, NonZeroScalar, ProjectivePoint};
 use plume_rustcrypto::{AffinePoint, PlumeSignature, PlumeSignatureV1Fields};
 
@@ -12,6 +13,8 @@ const G: ProjectivePoint = ProjectivePoint::GENERATOR;
 const M: &[u8; 29] = b"An example app message string";
 const C_V1: [u8; 32] =
     hex_literal::hex!("c6a7fc2c926ddbaf20731a479fb6566f2daa5514baae5223fe3b32edbce83254");
+const C_V1_BLAKE: [u8; 32] =
+    hex_literal::hex!("b08b2be490e53357ace0e659b58b350b3be4e7d5d1c7818a4fff974e6faf74e8");
 
 // `test_gen_signals` provides fixed key nullifier, secret key, and the random value for testing
 // Normally a secure enclave would generate these values, and output to a wallet implementation
@@ -92,6 +95,89 @@ fn plume_v1_test() {
     );
 
     assert!(verified);
+}
+
+#[test]
+fn plume_v1_c_test() {
+    let test_data = test_gen_signals(M, PlumeVersion::V1, HashVersion::Blake3);
+    let r_point = test_data.5.unwrap();
+    let hashed_to_curve_r = test_data.6.unwrap();
+
+    println!("c should be: {:?}", test_data.3);
+    println!("{}", NonZeroScalar::new(test_data.4).unwrap().to_string());
+
+    let sig = PlumeSignature {
+        message: M.to_owned().into(),
+        pk: (G * gen_test_scalar_sk()).into(),
+        nullifier: test_data.1.into(),
+        c: NonZeroScalar::from_repr(C_V1_BLAKE.into()).unwrap(),
+        s: NonZeroScalar::new(test_data.4).unwrap(),
+        v1specific: Some(PlumeSignatureV1Fields {
+            r_point: r_point.into(),
+            hashed_to_curve_r: hashed_to_curve_r.into(),
+        }),
+    };
+    let verified = sig.verify_blake();
+    println!("Verified: {}", verified);
+
+    // Print nullifier
+    println!(
+        "nullifier.x: {:?}",
+        hex::encode(sig.nullifier.to_encoded_point(false).x().unwrap())
+    );
+    println!(
+        "nullifier.y: {:?}",
+        hex::encode(sig.nullifier.to_encoded_point(false).y().unwrap())
+    );
+    // Print c
+    println!("c: {:?}", hex::encode(C_V1));
+    // Print r_sk_c
+    println!("r_sk_c: {:?}", hex::encode(sig.s.to_bytes()));
+    // Print g_r
+    println!(
+        "g_r.x: {:?}",
+        hex::encode(r_point.to_affine().to_encoded_point(false).x().unwrap())
+    );
+    println!(
+        "g_r.y: {:?}",
+        hex::encode(r_point.to_affine().to_encoded_point(false).y().unwrap())
+    );
+    // Print hash_m_pk_pow_r
+    println!(
+        "hash_m_pk_pow_r.x: {:?}",
+        hex::encode(
+            hashed_to_curve_r
+                .to_affine()
+                .to_encoded_point(false)
+                .x()
+                .unwrap()
+        )
+    );
+    println!(
+        "hash_m_pk_pow_r.y: {:?}",
+        hex::encode(
+            hashed_to_curve_r
+                .to_affine()
+                .to_encoded_point(false)
+                .y()
+                .unwrap()
+        )
+    );
+
+    assert!(verified);
+}
+// asserts c will never be 0
+#[test]
+fn plume_v1_c0_test() {
+    assert_eq!(
+        NonZeroScalar::from_repr(
+            hex_literal::hex!("0000000000000000000000000000000000000000000000000000000000000000")
+                .into(),
+        )
+        .is_none()
+        .unwrap_u8(),
+        1
+    );
 }
 
 #[test]
